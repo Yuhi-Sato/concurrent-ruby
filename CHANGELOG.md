@@ -1,5 +1,7 @@
 ## Current
 
+* Add a CAS fast path for `Semaphore` when the CRuby C extension is loaded, preserving permit-count arithmetic with a mutex fallback.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

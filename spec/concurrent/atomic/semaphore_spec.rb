@@ -328,11 +328,393 @@ RSpec.shared_examples :semaphore do
       end
     end
   end
+
+end
+
+# JavaSemaphore has stricter validation for zero permits and timeouts.
+RSpec.shared_examples :ruby_semaphore do
+  let(:semaphore) { described_class.new(3) }
+
+  describe 'zero permits' do
+    it 'acquires zero permits without changing the count' do
+      expect(semaphore.acquire(0) { :acquired }).to eq :acquired
+      expect(semaphore.try_acquire(0)).to be true
+      expect(semaphore.release(0)).to be_nil
+      expect(semaphore.available_permits).to eq 3
+    end
+
+    it 'cannot acquire zero permits while the count is negative' do
+      semaphore.reduce_permits(4)
+      expect(semaphore.try_acquire(0)).to be false
+      expect(semaphore.try_acquire(0, 0)).to be false
+    end
+  end
+
+  describe 'nonpositive timeouts' do
+    it 'acquires available permits even with an expired timeout' do
+      expect(semaphore.try_acquire(1, 0)).to be true
+      expect(semaphore.try_acquire(1, -1)).to be true
+    end
+
+    it 'returns immediately when insufficient permits are available' do
+      expect(semaphore.try_acquire(4, 0)).to be false
+      expect(semaphore.try_acquire(4, -1)).to be false
+      expect(semaphore.available_permits).to eq 3
+    end
+  end
+
+  describe 'counts outside the native integer range' do
+    it 'allows releases to grow the count beyond the upper bound' do
+      maximum = Concurrent::Utility::NativeInteger::MAX_VALUE
+      semaphore = described_class.new(maximum)
+      expect(semaphore.release).to be_nil
+      expect(semaphore.available_permits).to eq maximum + 1
+      expect(semaphore.try_acquire).to be true
+      expect(semaphore.available_permits).to eq maximum
+      expect(semaphore.drain_permits).to eq maximum
+    end
+
+    it 'allows reductions below the lower bound and drains the negative count' do
+      minimum = Concurrent::Utility::NativeInteger::MIN_VALUE
+      semaphore = described_class.new(minimum)
+      expect(semaphore.reduce_permits(1)).to be_nil
+      expect(semaphore.available_permits).to eq minimum - 1
+      expect(semaphore.try_acquire(0)).to be false
+      expect(semaphore.drain_permits).to eq minimum - 1
+      semaphore.release
+      expect(semaphore.try_acquire(1, 0) { :acquired }).to eq :acquired
+      expect(semaphore.available_permits).to eq 1
+    end
+  end
+
+  describe 'argument validation' do
+    [:acquire, :try_acquire, :release, :reduce_permits].each do |operation|
+      it "rejects noninteger and out of range arguments to #{operation}" do
+        expect { semaphore.public_send(operation, 1.5) }.to raise_error(ArgumentError)
+        expect {
+          semaphore.public_send(operation, Concurrent::Utility::NativeInteger::MAX_VALUE + 1)
+        }.to raise_error(RangeError)
+        expect(semaphore.available_permits).to eq 3
+      end
+    end
+  end
 end
 
 module Concurrent
   RSpec.describe MutexSemaphore do
     it_should_behave_like :semaphore
+    it_should_behave_like :ruby_semaphore
+  end
+
+  RSpec.describe AtomicSemaphore do
+    it_should_behave_like :semaphore
+    it_should_behave_like :ruby_semaphore
+
+    let(:semaphore) { described_class.new(1) }
+
+    it 'does not take the semaphore mutex on the fast path' do
+      expect(semaphore).not_to receive(:synchronize)
+      expect(semaphore.acquire).to be_nil
+      expect(semaphore.try_acquire).to be false
+      expect(semaphore.release).to be_nil
+      expect(semaphore.try_acquire(1, 1) { :acquired }).to eq :acquired
+      expect(semaphore.available_permits).to eq 1
+      expect(semaphore.drain_permits).to eq 1
+      expect(semaphore.reduce_permits(1)).to be_nil
+    end
+
+    it 'supports both native integer endpoints' do
+      [Utility::NativeInteger::MIN_VALUE, Utility::NativeInteger::MAX_VALUE].each do |count|
+        semaphore = described_class.new(count)
+        expect(semaphore.available_permits).to eq count
+        expect(semaphore.drain_permits).to eq count
+        expect(semaphore.available_permits).to eq 0
+      end
+    end
+
+    it 'accepts large updates and continues after returning to the native range' do
+      maximum = Utility::NativeInteger::MAX_VALUE
+      semaphore = described_class.new(0)
+      semaphore.release(maximum)
+      semaphore.release(maximum)
+      expect(semaphore.available_permits).to eq 2 * maximum
+      semaphore.acquire(maximum)
+      expect(semaphore.available_permits).to eq maximum
+      semaphore.reduce_permits(maximum)
+      semaphore.reduce_permits(maximum)
+      semaphore.reduce_permits(maximum)
+      expect(semaphore.available_permits).to eq(-2 * maximum)
+      expect(semaphore.drain_permits).to eq(-2 * maximum)
+      semaphore.release
+      expect(semaphore.acquire { :acquired }).to eq :acquired
+      expect(semaphore.available_permits).to eq 1
+    end
+
+    it 'preserves every release when threads cross the upper bound' do
+      maximum = Utility::NativeInteger::MAX_VALUE
+      semaphore = described_class.new(maximum - 1)
+      start = Queue.new
+      workers = 8.times.map do
+        in_thread do
+          start.pop
+          semaphore.release
+        end
+      end
+      workers.size.times { start << true }
+      join_with(workers)
+      expect(semaphore.available_permits).to eq maximum + 7
+    end
+
+    it 'preserves every reduction when threads cross the lower bound' do
+      minimum = Utility::NativeInteger::MIN_VALUE
+      semaphore = described_class.new(minimum + 1)
+      start = Queue.new
+      workers = 8.times.map do
+        in_thread do
+          start.pop
+          semaphore.reduce_permits(1)
+        end
+      end
+      workers.size.times { start << true }
+      join_with(workers)
+      expect(semaphore.available_permits).to eq minimum - 7
+    end
+
+    [:acquire, :release, :reduce_permits, :drain_permits].each do |operation|
+      it "retries a stale #{operation} CAS after promotion" do
+        maximum = Utility::NativeInteger::MAX_VALUE
+        semaphore = described_class.new(maximum - 1)
+        counter = semaphore.instance_variable_get(:@free)
+        start, paused, resume = Queue.new, Queue.new, Queue.new
+        worker = nil
+        intercepted = false
+        allow(counter).to receive(:compare_and_set).and_wrap_original do |original, *args|
+          if Thread.current == worker && !intercepted
+            intercepted = true
+            paused << true
+            resume.pop
+          end
+          original.call(*args)
+        end
+        worker = in_thread do
+          start.pop
+          operation == :reduce_permits ? semaphore.reduce_permits(1) : semaphore.public_send(operation)
+        end
+        start << true
+        paused.pop
+        semaphore.release(2)
+        resume << true
+        join_with(worker)
+        expected = { acquire: maximum, release: maximum + 2,
+                     reduce_permits: maximum, drain_permits: 0 }.fetch(operation)
+        expect(semaphore.available_permits).to eq expected
+        expect(worker.value).to eq maximum + 1 if operation == :drain_permits
+      end
+    end
+
+    it 'retries promotion when an acquisition changes the source count' do
+      maximum = Utility::NativeInteger::MAX_VALUE
+      semaphore = described_class.new(maximum)
+      counter = semaphore.instance_variable_get(:@free)
+      paused, resume = Queue.new, Queue.new
+      intercepted = false
+      allow(counter).to receive(:compare_and_set).and_wrap_original do |original, expected, updated|
+        if updated == Utility::NativeInteger::MIN_VALUE && !intercepted
+          intercepted = true
+          paused << true
+          resume.pop
+        end
+        original.call(expected, updated)
+      end
+      promoter = in_thread { semaphore.release }
+      paused.pop
+      semaphore.acquire
+      resume << true
+      join_with(promoter)
+      expect(semaphore.available_permits).to eq maximum
+      # A failed promotion must not leave a live fallback with stale permits.
+      semaphore.release(2)
+      expect(semaphore.available_permits).to eq maximum + 2
+    end
+
+    it 'does not overwrite an already promoted count with a stale promotion' do
+      maximum = Utility::NativeInteger::MAX_VALUE
+      semaphore = described_class.new(maximum)
+      start, paused, resume = Queue.new, Queue.new, Queue.new
+      worker = nil
+      allow(semaphore).to receive(:promote_permits).and_wrap_original do |original, *args|
+        if Thread.current == worker
+          paused << true
+          resume.pop
+        end
+        original.call(*args)
+      end
+      worker = in_thread { start.pop; semaphore.release }
+      start << true
+      paused.pop
+      semaphore.release(2)
+      resume << true
+      join_with(worker)
+      expect(semaphore.available_permits).to eq maximum + 3
+    end
+
+    it 'copies promoted counts without sharing their lock or updates' do
+      semaphore = described_class.new(Utility::NativeInteger::MAX_VALUE)
+      semaphore.release
+      copy = semaphore.dup
+      copy.release
+      expect(copy.available_permits).to eq semaphore.available_permits + 1
+      semaphore.drain_permits
+      expect(copy.available_permits).to eq Utility::NativeInteger::MAX_VALUE + 2
+    end
+
+    it 'retains waiting, timeout and block cleanup after promotion' do
+      semaphore = described_class.new(Utility::NativeInteger::MIN_VALUE + 1)
+      waiter = in_thread do
+        expect { semaphore.acquire { raise 'block failed' } }.to raise_error('block failed')
+      end
+      is_sleeping(waiter)
+      semaphore.reduce_permits(2)
+      expect(semaphore.try_acquire(1, 0.01)).to be false
+      semaphore.drain_permits
+      semaphore.release
+      join_with(waiter)
+      expect(semaphore.available_permits).to eq 1
+    end
+
+    it 'copies the permit count without sharing state or waiters' do
+      waiter = in_thread { semaphore.acquire(2) }
+      is_sleeping(waiter)
+      copy = semaphore.dup
+      expect(copy).not_to receive(:synchronize)
+      copy.release
+      expect(copy.available_permits).to eq 2
+      expect(semaphore.available_permits).to eq 1
+      semaphore.release
+      join_with(waiter)
+      expect(copy.available_permits).to eq 2
+      expect(semaphore.available_permits).to eq 0
+    end
+
+    it 'rechecks permits released before the waiter is registered' do
+      semaphore.acquire
+      released = false
+      allow(semaphore).to receive(:try_acquire_now).and_wrap_original do |original, permits|
+        acquired = original.call(permits)
+        unless acquired || released
+          released = true
+          semaphore.release
+        end
+        acquired
+      end
+      expect(semaphore).not_to receive(:ns_wait)
+      expect(semaphore.try_acquire(1, 1)).to be true
+      expect(semaphore.available_permits).to eq 0
+    end
+
+    it 'does not lose a release between the final recheck and sleeping' do
+      semaphore.acquire
+      resume = Queue.new
+      allow(semaphore).to receive(:ns_wait).and_wrap_original do |original, timeout|
+        resume.pop
+        original.call(timeout)
+      end
+
+      waiter = in_thread { semaphore.try_acquire(1, 5) }
+      is_sleeping(waiter)
+      releaser = in_thread { semaphore.release }
+      is_sleeping(releaser)
+      expect(semaphore.available_permits).to eq 1
+      resume << true
+
+      expect(waiter.join(1)).not_to be_nil
+      expect(waiter.value).to be true
+      join_with(releaser)
+      expect(semaphore.available_permits).to eq 0
+    end
+
+    it 'wakes an eligible waiter behind one requesting more permits' do
+      semaphore.acquire
+      large = in_thread { semaphore.acquire(2) }
+      is_sleeping(large)
+      small = in_thread { semaphore.acquire(1) }
+      is_sleeping(small)
+
+      semaphore.release
+      expect(small.join(1)).not_to be_nil
+      expect(large).to be_alive
+      semaphore.release(2)
+      join_with(large)
+      expect(semaphore.available_permits).to eq 0
+    end
+
+    it 'retains the waiter notification when draining and reducing permits' do
+      waiter = in_thread { semaphore.acquire(3) }
+      is_sleeping(waiter)
+      expect(semaphore.drain_permits).to eq 1
+      semaphore.reduce_permits(1)
+      semaphore.release(4)
+      join_with(waiter)
+      expect(semaphore.available_permits).to eq 0
+    end
+
+    it 'clears the waiter state after a timeout' do
+      semaphore.acquire
+      expect(semaphore.try_acquire(1, 0.01)).to be false
+      expect(semaphore).not_to receive(:synchronize)
+      semaphore.release
+      expect(semaphore.available_permits).to eq 1
+    end
+
+    it 'clears the waiter state after an interrupted wait' do
+      semaphore.acquire
+      waiter = in_thread { semaphore.acquire }
+      is_sleeping(waiter)
+      waiter.kill
+      join_with(waiter)
+      expect(semaphore).not_to receive(:synchronize)
+      semaphore.release
+      expect(semaphore.available_permits).to eq 1
+    end
+
+    it 'keeps notifying other waiters when one times out' do
+      semaphore.acquire
+      waiter = in_thread { semaphore.acquire }
+      is_sleeping(waiter)
+      expect(semaphore.try_acquire(2, 0.01)).to be false
+      semaphore.release
+      join_with(waiter)
+      expect(semaphore.available_permits).to eq 0
+    end
+
+    it 'does not oversubscribe permits under contention' do
+      semaphore = described_class.new(3)
+      lock = Mutex.new
+      active = 0
+      maximum = 0
+      start = Queue.new
+      workers = 8.times.map do |index|
+        in_thread do
+          start.pop
+          100.times do
+            permits = index % 3 + 1
+            semaphore.acquire(permits) do
+              lock.synchronize do
+                active += permits
+                maximum = [maximum, active].max
+              end
+              Thread.pass
+              lock.synchronize { active -= permits }
+            end
+          end
+        end
+      end
+      workers.size.times { start << true }
+      join_with(workers)
+      expect(maximum).to be <= 3
+      expect(active).to eq 0
+      expect(semaphore.available_permits).to eq 3
+    end
   end
 
   if Concurrent.on_jruby?
@@ -342,9 +724,16 @@ module Concurrent
   end
 
   RSpec.describe Semaphore do
+    it_should_behave_like :semaphore
+    it_should_behave_like :ruby_semaphore unless Concurrent.on_jruby?
+
     if Concurrent.on_jruby?
       it 'inherits from JavaSemaphore' do
         expect(Semaphore.ancestors).to include(JavaSemaphore)
+      end
+    elsif Concurrent.c_extensions_loaded?
+      it 'inherits from AtomicSemaphore' do
+        expect(Semaphore.ancestors).to include(AtomicSemaphore)
       end
     else
       it 'inherits from MutexSemaphore' do

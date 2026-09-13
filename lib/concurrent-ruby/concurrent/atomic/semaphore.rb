@@ -1,4 +1,5 @@
 require 'concurrent/atomic/mutex_semaphore'
+require 'concurrent/atomic/atomic_semaphore'
 
 module Concurrent
 
@@ -93,9 +94,13 @@ module Concurrent
 
   # @!visibility private
   # @!macro internal_implementation_note
+  # Use the CAS fast path only with native integer atomics; mutex-backed atomics add
+  # overhead compared with keeping the entire operation under one mutex.
   SemaphoreImplementation = if Concurrent.on_jruby?
                               require 'concurrent/utility/native_extension_loader'
                               JavaSemaphore
+                            elsif Concurrent.c_extensions_loaded?
+                              AtomicSemaphore
                             else
                               MutexSemaphore
                             end
